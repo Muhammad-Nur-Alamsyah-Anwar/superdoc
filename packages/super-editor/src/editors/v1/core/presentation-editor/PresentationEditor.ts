@@ -4,6 +4,7 @@ import { CellSelection } from 'prosemirror-tables';
 import { DecorationBridge } from './dom/DecorationBridge.js';
 import { ProofingSessionManager } from './proofing/ProofingSessionManager.js';
 import { applyProofingDecorations, clearProofingDecorations, createDomPainter } from '@superdoc/painter-dom';
+import { resolveLayout } from '@superdoc/layout-resolved';
 import type { ProofingAnnotation, LayoutMode, PaintSnapshot } from '@superdoc/painter-dom';
 import type { ProofingConfig, ProofingPaintSlice } from './proofing/types.js';
 import type { VisibilitySource } from './proofing/visibility-source.js';
@@ -78,13 +79,14 @@ import { readSettingsRoot, readDefaultTableStyle } from '../../document-api-adap
 import {
   incrementalLayout,
   selectionToRects,
-  clickToPosition,
   getFragmentAtPosition,
   extractIdentifierFromConverter,
   buildMultiSectionIdentifier,
   layoutHeaderFooterWithCache as _layoutHeaderFooterWithCache,
   PageGeometryHelper,
+  clickToPositionGeometry,
 } from '@superdoc/layout-bridge';
+import { resolvePointerPositionHit } from './input/PositionHitResolver.js';
 import type {
   HeaderFooterIdentifier,
   HeaderFooterLayoutResult,
@@ -2030,17 +2032,7 @@ export class PresentationEditor extends EventEmitter {
         x: localX,
         y: headerPageIndex * headerPageHeight + (localY - headerPageIndex * headerPageHeight),
       };
-      const hit =
-        clickToPosition(
-          context.layout,
-          context.blocks,
-          context.measures,
-          headerPoint,
-          undefined,
-          undefined,
-          undefined,
-          undefined,
-        ) ?? null;
+      const hit = clickToPositionGeometry(context.layout, context.blocks, context.measures, headerPoint) ?? null;
       return hit;
     }
 
@@ -2048,16 +2040,16 @@ export class PresentationEditor extends EventEmitter {
       return null;
     }
     const rawHit =
-      clickToPosition(
-        this.#layoutState.layout,
-        this.#layoutState.blocks,
-        this.#layoutState.measures,
-        normalized,
-        this.#viewportHost,
+      resolvePointerPositionHit({
+        layout: this.#layoutState.layout,
+        blocks: this.#layoutState.blocks,
+        measures: this.#layoutState.measures,
+        containerPoint: normalized,
+        domContainer: this.#viewportHost,
         clientX,
         clientY,
-        this.#pageGeometryHelper ?? undefined,
-      ) ?? null;
+        geometryHelper: this.#pageGeometryHelper ?? undefined,
+      }) ?? null;
     if (!rawHit) {
       return null;
     }
@@ -4170,6 +4162,7 @@ export class PresentationEditor extends EventEmitter {
 
       let layout: Layout;
       let measures: Measure[];
+      let resolvedLayout: ReturnType<typeof resolveLayout>;
       let headerLayouts: HeaderFooterLayoutResult[] | undefined;
       let footerLayouts: HeaderFooterLayoutResult[] | undefined;
       let extraBlocks: FlowBlock[] | undefined;
@@ -4210,6 +4203,14 @@ export class PresentationEditor extends EventEmitter {
         // Gap depends on virtualization mode and must be non-negative.
         layout.pageGap = this.#getEffectivePageGap();
         (layout as Layout & { layoutEpoch?: number }).layoutEpoch = layoutEpoch;
+
+        resolvedLayout = resolveLayout({
+          layout,
+          flowMode: this.#layoutOptions.flowMode ?? 'paginated',
+          blocks: blocksForLayout,
+          measures,
+        });
+
         headerLayouts = result.headers;
         footerLayouts = result.footers;
       } catch (error) {
@@ -4277,6 +4278,7 @@ export class PresentationEditor extends EventEmitter {
       }
 
       const painter = this.#ensurePainter(blocksForLayout, measures);
+      painter.setResolvedLayout?.(resolvedLayout);
       if (!isSemanticFlow && typeof painter.setProviders === 'function') {
         painter.setProviders(
           this.#headerFooterSession?.headerDecorationProvider,
@@ -5627,16 +5629,16 @@ export class PresentationEditor extends EventEmitter {
       extraPages: dragLastRawHit ? [dragLastRawHit.pageIndex] : undefined,
     });
 
-    const refined = clickToPosition(
+    const refined = resolvePointerPositionHit({
       layout,
-      this.#layoutState.blocks,
-      this.#layoutState.measures,
-      { x: normalized.x, y: normalized.y },
-      this.#viewportHost,
-      pointer.clientX,
-      pointer.clientY,
-      this.#pageGeometryHelper ?? undefined,
-    );
+      blocks: this.#layoutState.blocks,
+      measures: this.#layoutState.measures,
+      containerPoint: { x: normalized.x, y: normalized.y },
+      domContainer: this.#viewportHost,
+      clientX: pointer.clientX,
+      clientY: pointer.clientY,
+      geometryHelper: this.#pageGeometryHelper ?? undefined,
+    });
     if (!refined) return;
 
     if (this.#isSelectionAwareVirtualizationEnabled() && this.#getPageElement(refined.pageIndex) == null) {

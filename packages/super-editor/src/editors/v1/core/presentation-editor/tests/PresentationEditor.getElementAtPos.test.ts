@@ -48,6 +48,7 @@ const {
       setLayoutMode: vi.fn(),
       setProviders: vi.fn(),
       setData: vi.fn(),
+      setResolvedLayout: vi.fn(),
     })),
     mockEditorConverterStore: converterStore,
     mockEditorOverlayManager: vi.fn().mockImplementation(() => ({
@@ -65,6 +66,11 @@ const {
     })),
   };
 });
+
+// Mock PositionHitResolver
+vi.mock('../input/PositionHitResolver.js', () => ({
+  resolvePointerPositionHit: (...args: unknown[]) => mockClickToPosition(...args),
+}));
 
 vi.mock('../../Editor.js', () => {
   return {
@@ -130,6 +136,7 @@ vi.mock('@superdoc/layout-bridge', () => ({
   incrementalLayout: mockIncrementalLayout,
   selectionToRects: mockSelectionToRects,
   clickToPosition: mockClickToPosition,
+  clickToPositionGeometry: vi.fn(() => null),
   createDragHandler: vi.fn(() => () => {}),
   getFragmentAtPosition: vi.fn(() => null),
   computeLinePmRange: vi.fn(() => ({ from: 0, to: 0 })),
@@ -173,6 +180,10 @@ vi.mock('@superdoc/painter-dom', () => ({
 
 vi.mock('../../header-footer/EditorOverlayManager.js', () => ({
   EditorOverlayManager: mockEditorOverlayManager,
+}));
+
+vi.mock('@superdoc/layout-resolved', () => ({
+  resolveLayout: vi.fn(() => ({ version: 1, flowMode: 'paginated', pageGap: 0, pages: [] })),
 }));
 
 describe('PresentationEditor.getElementAtPos', () => {

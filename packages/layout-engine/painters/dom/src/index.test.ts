@@ -5,9 +5,11 @@ import type {
   FlowBlock,
   Measure,
   Layout,
+  Line,
   ParagraphMeasure,
   FlowRunLink,
   Fragment,
+  ResolvedLayout,
   TableBlock,
   TableMeasure,
 } from '@superdoc/contracts';
@@ -100,6 +102,34 @@ const buildSingleParagraphData = (blockId: string, runLength: number) => {
 
   return { paragraphMeasure, paragraphLayout };
 };
+
+const createResolvedTestLine = (textLength: number, overrides: Partial<Line> = {}): Line => ({
+  fromRun: 0,
+  fromChar: 0,
+  toRun: 0,
+  toChar: textLength,
+  width: 160,
+  ascent: 12,
+  descent: 4,
+  lineHeight: 20,
+  ...overrides,
+});
+
+const createSinglePageResolvedLayout = (item: ResolvedLayout['pages'][number]['items'][number]): ResolvedLayout => ({
+  version: 1,
+  flowMode: 'paginated',
+  pageGap: 0,
+  pages: [
+    {
+      id: 'page-0',
+      index: 0,
+      number: 1,
+      width: 400,
+      height: 500,
+      items: [item],
+    },
+  ],
+});
 
 const expectCssColor = (actual: string, expectedHex: string): void => {
   const normalizedActual = actual.replace(/\s+/g, '').toLowerCase();
@@ -3999,6 +4029,560 @@ describe('DomPainter', () => {
 
     const marker = mount.querySelector('.superdoc-list-marker');
     expect(marker?.textContent).toBe('1.');
+  });
+
+  it('preserves marker-adjusted list-item wrapper geometry during resolved incremental updates', () => {
+    const listBlock: FlowBlock = {
+      kind: 'list',
+      id: 'list-1',
+      listType: 'number',
+      items: [
+        {
+          id: 'item-1',
+          marker: { kind: 'number', text: '1.', level: 0, order: 1 },
+          paragraph: block,
+        },
+      ],
+    };
+
+    const listMeasure: Measure = {
+      kind: 'list',
+      items: [
+        {
+          itemId: 'item-1',
+          markerWidth: 30,
+          markerTextWidth: 18,
+          indentLeft: 0,
+          paragraph: measure as ParagraphMeasure,
+        },
+      ],
+      totalHeight: measure.totalHeight,
+    };
+
+    const initialLayout: Layout = {
+      pageSize: layout.pageSize,
+      pages: [
+        {
+          number: 1,
+          fragments: [
+            {
+              kind: 'list-item',
+              blockId: 'list-1',
+              itemId: 'item-1',
+              fromLine: 0,
+              toLine: 1,
+              x: 100,
+              y: 40,
+              width: 260,
+              markerWidth: 30,
+            },
+          ],
+        },
+      ],
+    };
+
+    const updatedLayout: Layout = {
+      pageSize: layout.pageSize,
+      pages: [
+        {
+          number: 1,
+          fragments: [
+            {
+              kind: 'list-item',
+              blockId: 'list-1',
+              itemId: 'item-1',
+              fromLine: 0,
+              toLine: 1,
+              x: 120,
+              y: 55,
+              width: 280,
+              markerWidth: 30,
+            },
+          ],
+        },
+      ],
+    };
+
+    const initialResolvedLayout: ResolvedLayout = {
+      version: 1,
+      flowMode: 'paginated',
+      pageGap: 0,
+      pages: [
+        {
+          id: 'page-0',
+          index: 0,
+          number: 1,
+          width: 400,
+          height: 500,
+          items: [
+            {
+              kind: 'fragment',
+              id: 'list-item:list-1:item-1:0:1',
+              pageIndex: 0,
+              x: 100,
+              y: 40,
+              width: 260,
+              height: 20,
+              fragmentKind: 'list-item',
+              blockId: 'list-1',
+              fragmentIndex: 0,
+            },
+          ],
+        },
+      ],
+    };
+
+    const updatedResolvedLayout: ResolvedLayout = {
+      version: 1,
+      flowMode: 'paginated',
+      pageGap: 0,
+      pages: [
+        {
+          id: 'page-0',
+          index: 0,
+          number: 1,
+          width: 400,
+          height: 500,
+          items: [
+            {
+              kind: 'fragment',
+              id: 'list-item:list-1:item-1:0:1',
+              pageIndex: 0,
+              x: 120,
+              y: 55,
+              width: 280,
+              height: 20,
+              fragmentKind: 'list-item',
+              blockId: 'list-1',
+              fragmentIndex: 0,
+            },
+          ],
+        },
+      ],
+    };
+
+    const painter = createDomPainter({ blocks: [listBlock], measures: [listMeasure] });
+
+    painter.setResolvedLayout?.(initialResolvedLayout);
+    painter.paint(initialLayout, mount);
+
+    const initialWrapper = mount.querySelector('.superdoc-fragment-list-item') as HTMLElement;
+    expect(initialWrapper.style.left).toBe('70px');
+    expect(initialWrapper.style.top).toBe('40px');
+    expect(initialWrapper.style.width).toBe('290px');
+
+    painter.setResolvedLayout?.(updatedResolvedLayout);
+    painter.paint(updatedLayout, mount);
+
+    const updatedWrapper = mount.querySelector('.superdoc-fragment-list-item') as HTMLElement;
+    expect(updatedWrapper).toBe(initialWrapper);
+    expect(updatedWrapper.style.left).toBe('90px');
+    expect(updatedWrapper.style.top).toBe('55px');
+    expect(updatedWrapper.style.width).toBe('310px');
+  });
+
+  it('applies resolved zIndex only to anchored media fragments', () => {
+    const anchoredDrawingBlock: FlowBlock = {
+      kind: 'drawing',
+      id: 'drawing-anchored',
+      drawingKind: 'vectorShape',
+      geometry: { width: 10, height: 10 },
+      anchor: { isAnchored: true },
+    };
+
+    const inlineDrawingBlock: FlowBlock = {
+      kind: 'drawing',
+      id: 'drawing-inline',
+      drawingKind: 'vectorShape',
+      geometry: { width: 10, height: 10 },
+      zIndex: 1,
+    };
+
+    const drawingMeasure: Measure = {
+      kind: 'drawing',
+      drawingKind: 'vectorShape',
+      width: 30,
+      height: 15,
+      scale: 1,
+      naturalWidth: 30,
+      naturalHeight: 15,
+      geometry: { width: 10, height: 10 },
+    };
+
+    const drawingLayout: Layout = {
+      pageSize: layout.pageSize,
+      pages: [
+        {
+          number: 1,
+          fragments: [
+            {
+              kind: 'drawing',
+              drawingKind: 'vectorShape',
+              blockId: 'drawing-anchored',
+              x: 30,
+              y: 40,
+              width: 30,
+              height: 15,
+              isAnchored: true,
+              zIndex: 7,
+              geometry: { width: 10, height: 10 },
+              scale: 1,
+            },
+            {
+              kind: 'drawing',
+              drawingKind: 'vectorShape',
+              blockId: 'drawing-inline',
+              x: 30,
+              y: 80,
+              width: 30,
+              height: 15,
+              zIndex: 1,
+              geometry: { width: 10, height: 10 },
+              scale: 1,
+            },
+          ],
+        },
+      ],
+    };
+
+    const resolvedLayout: ResolvedLayout = {
+      version: 1,
+      flowMode: 'paginated',
+      pageGap: 0,
+      pages: [
+        {
+          id: 'page-0',
+          index: 0,
+          number: 1,
+          width: 400,
+          height: 500,
+          items: [
+            {
+              kind: 'fragment',
+              id: 'drawing:drawing-anchored:30:40',
+              pageIndex: 0,
+              x: 30,
+              y: 40,
+              width: 30,
+              height: 15,
+              zIndex: 7,
+              fragmentKind: 'drawing',
+              blockId: 'drawing-anchored',
+              fragmentIndex: 0,
+            },
+            {
+              kind: 'fragment',
+              id: 'drawing:drawing-inline:30:80',
+              pageIndex: 0,
+              x: 30,
+              y: 80,
+              width: 30,
+              height: 15,
+              zIndex: 1,
+              fragmentKind: 'drawing',
+              blockId: 'drawing-inline',
+              fragmentIndex: 1,
+            },
+          ],
+        },
+      ],
+    };
+
+    const painter = createDomPainter({
+      blocks: [anchoredDrawingBlock, inlineDrawingBlock],
+      measures: [drawingMeasure, drawingMeasure],
+    });
+
+    painter.setResolvedLayout?.(resolvedLayout);
+    painter.paint(drawingLayout, mount);
+
+    const anchoredDrawingEl = mount.querySelector('[data-block-id="drawing-anchored"]') as HTMLElement;
+    const inlineDrawingEl = mount.querySelector('[data-block-id="drawing-inline"]') as HTMLElement;
+
+    expect(anchoredDrawingEl.style.zIndex).toBe('7');
+    expect(inlineDrawingEl.style.zIndex).toBe('');
+  });
+
+  describe('resolved paragraph rendering', () => {
+    it('renders resolved paragraph lines with precomputed indent styles', () => {
+      const paragraphBlock: FlowBlock = {
+        kind: 'paragraph',
+        id: 'resolved-indent',
+        runs: [{ text: 'Resolved paragraph text', fontFamily: 'Arial', fontSize: 16, pmStart: 1, pmEnd: 24 }],
+        attrs: {
+          indent: { left: 0, hanging: 36 },
+        },
+      };
+
+      const paragraphMeasure: Measure = {
+        kind: 'paragraph',
+        lines: [createResolvedTestLine(10), createResolvedTestLine(22, { fromChar: 10, toChar: 22 })],
+        totalHeight: 40,
+      };
+
+      const paragraphLayout: Layout = {
+        pageSize: { w: 400, h: 500 },
+        pages: [
+          {
+            number: 1,
+            fragments: [
+              {
+                kind: 'para',
+                blockId: 'resolved-indent',
+                fromLine: 0,
+                toLine: 2,
+                x: 30,
+                y: 40,
+                width: 300,
+                pmStart: 1,
+                pmEnd: 24,
+              },
+            ],
+          },
+        ],
+      };
+
+      const resolvedLayout = createSinglePageResolvedLayout({
+        kind: 'fragment',
+        id: 'para:resolved-indent:0:2',
+        pageIndex: 0,
+        x: 30,
+        y: 40,
+        width: 300,
+        height: 40,
+        fragmentKind: 'para',
+        blockId: 'resolved-indent',
+        fragmentIndex: 0,
+        content: {
+          lines: [
+            {
+              line: createResolvedTestLine(10),
+              lineIndex: 0,
+              availableWidth: 300,
+              skipJustify: false,
+              paddingLeftPx: 0,
+              paddingRightPx: 12,
+              textIndentPx: -36,
+              isListFirstLine: false,
+              hasExplicitSegmentPositioning: false,
+              indentOffset: 0,
+            },
+            {
+              line: createResolvedTestLine(22, { fromChar: 10, toChar: 22 }),
+              lineIndex: 1,
+              availableWidth: 300,
+              skipJustify: true,
+              paddingLeftPx: 36,
+              paddingRightPx: 12,
+              textIndentPx: 0,
+              isListFirstLine: false,
+              hasExplicitSegmentPositioning: false,
+              indentOffset: 0,
+            },
+          ],
+        },
+      });
+
+      const painter = createDomPainter({
+        blocks: [paragraphBlock],
+        measures: [paragraphMeasure],
+      });
+
+      painter.setResolvedLayout?.(resolvedLayout);
+      painter.paint(paragraphLayout, mount);
+
+      const lineEls = mount.querySelectorAll('.superdoc-line');
+      expect(lineEls).toHaveLength(2);
+      expect((lineEls[0] as HTMLElement).style.textIndent).toBe('-36px');
+      expect((lineEls[0] as HTMLElement).style.paddingRight).toBe('12px');
+      expect((lineEls[1] as HTMLElement).style.paddingLeft).toBe('36px');
+      expect((lineEls[1] as HTMLElement).style.paddingRight).toBe('12px');
+      expect((lineEls[1] as HTMLElement).style.textIndent).toBe('0px');
+    });
+
+    it('renders a resolved list marker without legacy wordLayout metadata', () => {
+      const paragraphBlock: FlowBlock = {
+        kind: 'paragraph',
+        id: 'resolved-marker',
+        runs: [{ text: 'List item text', fontFamily: 'Arial', fontSize: 12, pmStart: 1, pmEnd: 15 }],
+      };
+
+      const paragraphMeasure: Measure = {
+        kind: 'paragraph',
+        lines: [createResolvedTestLine(14)],
+        totalHeight: 20,
+      };
+
+      const paragraphLayout: Layout = {
+        pageSize: { w: 400, h: 500 },
+        pages: [
+          {
+            number: 1,
+            fragments: [
+              {
+                kind: 'para',
+                blockId: 'resolved-marker',
+                fromLine: 0,
+                toLine: 1,
+                x: 30,
+                y: 40,
+                width: 300,
+                pmStart: 1,
+                pmEnd: 15,
+              },
+            ],
+          },
+        ],
+      };
+
+      const resolvedLayout = createSinglePageResolvedLayout({
+        kind: 'fragment',
+        id: 'para:resolved-marker:0:1',
+        pageIndex: 0,
+        x: 30,
+        y: 40,
+        width: 300,
+        height: 20,
+        fragmentKind: 'para',
+        blockId: 'resolved-marker',
+        fragmentIndex: 0,
+        content: {
+          lines: [
+            {
+              line: createResolvedTestLine(14),
+              lineIndex: 0,
+              availableWidth: 300,
+              skipJustify: true,
+              paddingLeftPx: 0,
+              paddingRightPx: 0,
+              textIndentPx: 0,
+              isListFirstLine: true,
+              hasExplicitSegmentPositioning: false,
+              indentOffset: 0,
+            },
+          ],
+          marker: {
+            text: '1.',
+            justification: 'left',
+            suffix: 'tab',
+            markerStartPx: 0,
+            suffixWidthPx: 24,
+            firstLinePaddingLeftPx: 36,
+            run: {
+              fontFamily: 'Arial',
+              fontSize: 12,
+            },
+          },
+        },
+      });
+
+      const painter = createDomPainter({
+        blocks: [paragraphBlock],
+        measures: [paragraphMeasure],
+      });
+
+      painter.setResolvedLayout?.(resolvedLayout);
+      painter.paint(paragraphLayout, mount);
+
+      const lineEl = mount.querySelector('.superdoc-line') as HTMLElement;
+      const markerEl = mount.querySelector('.superdoc-paragraph-marker') as HTMLElement;
+      const tabEl = mount.querySelector('.superdoc-tab') as HTMLElement;
+
+      expect(markerEl.textContent).toBe('1.');
+      expect(lineEl.style.paddingLeft).toBe('36px');
+      expect(tabEl.style.width).toBe('24px');
+    });
+
+    it('renders a resolved drop cap without a legacy descriptor on the block', () => {
+      const paragraphBlock: FlowBlock = {
+        kind: 'paragraph',
+        id: 'resolved-drop-cap',
+        runs: [{ text: 'Hello world', fontFamily: 'Arial', fontSize: 16, pmStart: 1, pmEnd: 12 }],
+      };
+
+      const paragraphMeasure: Measure = {
+        kind: 'paragraph',
+        lines: [createResolvedTestLine(11)],
+        totalHeight: 20,
+      };
+
+      const paragraphLayout: Layout = {
+        pageSize: { w: 400, h: 500 },
+        pages: [
+          {
+            number: 1,
+            fragments: [
+              {
+                kind: 'para',
+                blockId: 'resolved-drop-cap',
+                fromLine: 0,
+                toLine: 1,
+                x: 30,
+                y: 40,
+                width: 300,
+                pmStart: 1,
+                pmEnd: 12,
+              },
+            ],
+          },
+        ],
+      };
+
+      const resolvedLayout = createSinglePageResolvedLayout({
+        kind: 'fragment',
+        id: 'para:resolved-drop-cap:0:1',
+        pageIndex: 0,
+        x: 30,
+        y: 40,
+        width: 300,
+        height: 20,
+        fragmentKind: 'para',
+        blockId: 'resolved-drop-cap',
+        fragmentIndex: 0,
+        content: {
+          lines: [
+            {
+              line: createResolvedTestLine(11),
+              lineIndex: 0,
+              availableWidth: 300,
+              skipJustify: true,
+              paddingLeftPx: 0,
+              paddingRightPx: 0,
+              textIndentPx: 0,
+              isListFirstLine: false,
+              hasExplicitSegmentPositioning: false,
+              indentOffset: 0,
+            },
+          ],
+          dropCap: {
+            text: 'H',
+            mode: 'drop',
+            fontFamily: 'Georgia',
+            fontSize: 72,
+            bold: true,
+            color: '#112233',
+            width: 50,
+            height: 60,
+          },
+        },
+      });
+
+      const painter = createDomPainter({
+        blocks: [paragraphBlock],
+        measures: [paragraphMeasure],
+      });
+
+      painter.setResolvedLayout?.(resolvedLayout);
+      painter.paint(paragraphLayout, mount);
+
+      const dropCapEl = mount.querySelector('.superdoc-drop-cap') as HTMLElement;
+      expect(dropCapEl.textContent).toBe('H');
+      expect(dropCapEl.style.fontFamily).toBe('Georgia');
+      expect(dropCapEl.style.fontSize).toBe('72px');
+      expect(dropCapEl.style.fontWeight).toBe('bold');
+      expect(dropCapEl.style.width).toBe('50px');
+      expect(dropCapEl.style.height).toBe('60px');
+    });
   });
 
   it('applies run-level decorations and hyperlinks', () => {

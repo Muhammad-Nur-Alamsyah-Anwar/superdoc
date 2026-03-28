@@ -41,11 +41,15 @@ import type {
   TableBlock,
   TableCellAttrs,
   TableFragment,
+  MathRun,
   TextRun,
   TrackedChangeKind,
   TrackedChangesMode,
   VectorShapeDrawing,
   VectorShapeStyle,
+  ResolvedLayout,
+  ResolvedFragmentItem,
+  ResolvedPage,
 } from '@superdoc/contracts';
 import { calculateJustifySpacing, computeLinePmRange, shouldApplyJustify, SPACE_CHARS } from '@superdoc/contracts';
 import { toCssFontFamily } from '@superdoc/font-utils';
@@ -85,6 +89,7 @@ import {
 import { applyAlphaToSVG, applyGradientToSVG, validateHexColor } from './svg-utils.js';
 import { renderTableFragment as renderTableFragmentElement } from './table/renderTableFragment.js';
 import { applyImageClipPath } from './utils/image-clip-path.js';
+import { isMinimalWordLayout as isMinimalWordLayoutShared } from '@superdoc/common/list-marker-utils';
 import {
   computeTabWidth,
   resolvePainterListMarkerGeometry,
@@ -109,6 +114,7 @@ import {
   type BetweenBorderInfo,
 } from './features/paragraph-borders/index.js';
 import { applyRtlStyles, shouldUseSegmentPositioning } from './features/rtl-paragraph/index.js';
+import { convertOmmlToMathml } from './features/math/index.js';
 
 /**
  * Minimal type for WordParagraphLayoutOutput marker data used in rendering.
@@ -189,90 +195,11 @@ type VectorShapeDrawingWithEffects = VectorShapeDrawing & {
 };
 
 /**
- * Type guard to check if a value is a valid MinimalWordLayout object.
- *
- * This guard validates that the object has the expected structure for MinimalWordLayout
- * without unsafe type assertions. It checks for the presence of valid properties and
- * ensures type safety when accessing wordLayout from block attributes.
- *
- * @param value - The value to check (typically from block.attrs?.wordLayout)
- * @returns True if the value is a valid MinimalWordLayout object, false otherwise
- *
- * @example
- * ```typescript
- * const wordLayout = block.attrs?.wordLayout;
- * if (isMinimalWordLayout(wordLayout)) {
- *   // TypeScript now knows wordLayout is MinimalWordLayout
- *   const marker = wordLayout.marker;
- *   const isFirstLineMode = wordLayout.firstLineIndentMode === true;
- * }
- * ```
+ * Type guard narrowing to the renderer-local MinimalWordLayout type.
+ * Delegates structural validation to the shared isMinimalWordLayout guard.
  */
 function isMinimalWordLayout(value: unknown): value is MinimalWordLayout {
-  if (typeof value !== 'object' || value === null) {
-    return false;
-  }
-
-  const obj = value as Record<string, unknown>;
-
-  // Check marker property if present
-  if (obj.marker !== undefined) {
-    if (typeof obj.marker !== 'object' || obj.marker === null) {
-      return false;
-    }
-    const marker = obj.marker as Record<string, unknown>;
-
-    // Validate marker.markerText if present (must be a string)
-    if (marker.markerText !== undefined && typeof marker.markerText !== 'string') {
-      return false;
-    }
-
-    // Validate marker.markerX if present
-    if (marker.markerX !== undefined && typeof marker.markerX !== 'number') {
-      return false;
-    }
-
-    // Validate marker.textStartX if present
-    if (marker.textStartX !== undefined && typeof marker.textStartX !== 'number') {
-      return false;
-    }
-  }
-
-  // Check indentLeftPx property if present
-  if (obj.indentLeftPx !== undefined) {
-    if (typeof obj.indentLeftPx !== 'number') {
-      return false;
-    }
-  }
-
-  // Check firstLineIndentMode property if present
-  if (obj.firstLineIndentMode !== undefined) {
-    if (typeof obj.firstLineIndentMode !== 'boolean') {
-      return false;
-    }
-  }
-
-  // Check textStartPx property if present
-  if (obj.textStartPx !== undefined) {
-    if (typeof obj.textStartPx !== 'number') {
-      return false;
-    }
-  }
-
-  // Check tabsPx property if present and validate all array elements are numbers
-  if (obj.tabsPx !== undefined) {
-    if (!Array.isArray(obj.tabsPx)) {
-      return false;
-    }
-    // Validate that all elements are numbers
-    for (const tab of obj.tabsPx) {
-      if (typeof tab !== 'number') {
-        return false;
-      }
-    }
-  }
-
-  return true;
+  return isMinimalWordLayoutShared(value);
 }
 
 /**
@@ -1148,6 +1075,8 @@ export class DomPainter {
   private activeCommentId: string | null = null;
   private paintSnapshotBuilder: PaintSnapshotBuilder | null = null;
   private lastPaintSnapshot: PaintSnapshot | null = null;
+  /** Resolved layout for the next-gen paint pipeline (stored but not yet consumed). */
+  private resolvedLayout: ResolvedLayout | null = null;
 
   constructor(blocks: FlowBlock[], measures: Measure[], options: PainterOptions = {}) {
     this.options = options;
@@ -1276,6 +1205,28 @@ export class DomPainter {
    */
   public getActiveComment(): string | null {
     return this.activeCommentId;
+  }
+
+  /**
+   * Stores the resolved layout for the next-generation paint pipeline.
+   * When set, the painter sources page dimensions and fragment wrapper positioning
+   * from resolved data, falling back to legacy Layout when null.
+   */
+  public setResolvedLayout(resolvedLayout: ResolvedLayout | null): void {
+    this.resolvedLayout = resolvedLayout;
+  }
+
+  /** Returns the resolved page for a given index, or null if resolved data is unavailable. */
+  private getResolvedPage(pageIndex: number): ResolvedPage | null {
+    return this.resolvedLayout?.pages[pageIndex] ?? null;
+  }
+
+  /** Returns the resolved fragment item for a given page/fragment index, or undefined. */
+  private getResolvedFragmentItem(pageIndex: number, fragmentIndex: number): ResolvedFragmentItem | undefined {
+    const page = this.getResolvedPage(pageIndex);
+    if (!page) return undefined;
+    const item = page.items[fragmentIndex];
+    return item?.kind === 'fragment' ? item : undefined;
   }
 
   /**
@@ -1747,7 +1698,10 @@ export class DomPainter {
     if (!this.currentLayout) return;
     const N = this.currentLayout.pages.length;
     if (N !== this.virtualHeights.length) {
-      this.virtualHeights = this.currentLayout.pages.map((p) => p.size?.h ?? this.currentLayout!.pageSize.h);
+      this.virtualHeights = this.currentLayout.pages.map((p, i) => {
+        const resolved = this.getResolvedPage(i);
+        return resolved?.height ?? p.size?.h ?? this.currentLayout!.pageSize.h;
+      });
     }
     // Build offsets where offsets[i] = sum_{k < i} (height[k] + gap).
     // Use virtualGap to match CSS gap on virtualPagesEl.
@@ -1904,7 +1858,8 @@ export class DomPainter {
     // Insert or patch needed pages
     for (const i of mounted) {
       const page = layout.pages[i];
-      const pageSize = page.size ?? layout.pageSize;
+      const resolved = this.getResolvedPage(i);
+      const pageSize = resolved ? { w: resolved.width, h: resolved.height } : (page.size ?? layout.pageSize);
       const existing = this.pageIndexToState.get(i);
       if (!existing) {
         const newState = this.createPageState(page, pageSize, i);
@@ -2007,7 +1962,8 @@ export class DomPainter {
     if (!this.doc) return;
     mount.innerHTML = '';
     layout.pages.forEach((page, pageIndex) => {
-      const pageSize = page.size ?? layout.pageSize;
+      const resolved = this.getResolvedPage(pageIndex);
+      const pageSize = resolved ? { w: resolved.width, h: resolved.height } : (page.size ?? layout.pageSize);
       const pageEl = this.renderPage(pageSize.w, pageSize.h, page, pageIndex);
       mount.appendChild(pageEl);
     });
@@ -2019,7 +1975,10 @@ export class DomPainter {
     const pages = layout.pages;
     if (pages.length === 0) return;
 
-    const firstPageSize = pages[0].size ?? layout.pageSize;
+    const firstResolved = this.getResolvedPage(0);
+    const firstPageSize = firstResolved
+      ? { w: firstResolved.width, h: firstResolved.height }
+      : (pages[0].size ?? layout.pageSize);
     const firstPageEl = this.renderPage(firstPageSize.w, firstPageSize.h, pages[0], 0);
     mount.appendChild(firstPageEl);
 
@@ -2029,13 +1988,19 @@ export class DomPainter {
       applyStyles(spreadEl, spreadStyles);
 
       const leftPage = pages[i];
-      const leftPageSize = leftPage.size ?? layout.pageSize;
+      const leftResolved = this.getResolvedPage(i);
+      const leftPageSize = leftResolved
+        ? { w: leftResolved.width, h: leftResolved.height }
+        : (leftPage.size ?? layout.pageSize);
       const leftPageEl = this.renderPage(leftPageSize.w, leftPageSize.h, leftPage, i);
       spreadEl.appendChild(leftPageEl);
 
       if (i + 1 < pages.length) {
         const rightPage = pages[i + 1];
-        const rightPageSize = rightPage.size ?? layout.pageSize;
+        const rightResolved = this.getResolvedPage(i + 1);
+        const rightPageSize = rightResolved
+          ? { w: rightResolved.width, h: rightResolved.height }
+          : (rightPage.size ?? layout.pageSize);
         const rightPageEl = this.renderPage(rightPageSize.w, rightPageSize.h, rightPage, i + 1);
         spreadEl.appendChild(rightPageEl);
       }
@@ -2077,7 +2042,10 @@ export class DomPainter {
 
     page.fragments.forEach((fragment, index) => {
       const sdtBoundary = sdtBoundaries.get(index);
-      el.appendChild(this.renderFragment(fragment, contextBase, sdtBoundary, betweenBorderFlags.get(index)));
+      const resolvedItem = this.getResolvedFragmentItem(pageIndex, index);
+      el.appendChild(
+        this.renderFragment(fragment, contextBase, sdtBoundary, betweenBorderFlags.get(index), resolvedItem),
+      );
     });
     this.renderDecorationsForPage(el, page, pageIndex);
     return el;
@@ -2433,7 +2401,8 @@ export class DomPainter {
     this.pageStates = [];
 
     layout.pages.forEach((page, pageIndex) => {
-      const pageSize = page.size ?? layout.pageSize;
+      const resolved = this.getResolvedPage(pageIndex);
+      const pageSize = resolved ? { w: resolved.width, h: resolved.height } : (page.size ?? layout.pageSize);
       const pageState = this.createPageState(page, pageSize, pageIndex);
       pageState.element.dataset.pageNumber = String(page.number);
       pageState.element.dataset.pageIndex = String(pageIndex);
@@ -2448,7 +2417,8 @@ export class DomPainter {
     const nextStates: PageDomState[] = [];
 
     layout.pages.forEach((page, index) => {
-      const pageSize = page.size ?? layout.pageSize;
+      const resolved = this.getResolvedPage(index);
+      const pageSize = resolved ? { w: resolved.width, h: resolved.height } : (page.size ?? layout.pageSize);
       const prevState = this.pageStates[index];
       if (!prevState) {
         const newState = this.createPageState(page, pageSize, index);
@@ -2497,6 +2467,7 @@ export class DomPainter {
       const current = existing.get(key);
       const sdtBoundary = sdtBoundaries.get(index);
       const betweenInfo = betweenBorderFlags.get(index);
+      const resolvedItem = this.getResolvedFragmentItem(pageIndex, index);
 
       if (current) {
         existing.delete(key);
@@ -2523,7 +2494,7 @@ export class DomPainter {
           mappingUnreliable;
 
         if (needsRebuild) {
-          const replacement = this.renderFragment(fragment, contextBase, sdtBoundary, betweenInfo);
+          const replacement = this.renderFragment(fragment, contextBase, sdtBoundary, betweenInfo, resolvedItem);
           pageEl.replaceChild(replacement, current.element);
           current.element = replacement;
           current.signature = fragmentSignature(fragment, this.blockLookup);
@@ -2532,7 +2503,7 @@ export class DomPainter {
           this.updatePositionAttributes(current.element, this.currentMapping);
         }
 
-        this.updateFragmentElement(current.element, fragment, contextBase.section);
+        this.updateFragmentElement(current.element, fragment, contextBase.section, resolvedItem);
         if (sdtBoundary?.widthOverride != null) {
           current.element.style.width = `${sdtBoundary.widthOverride}px`;
         }
@@ -2544,7 +2515,7 @@ export class DomPainter {
         return;
       }
 
-      const fresh = this.renderFragment(fragment, contextBase, sdtBoundary, betweenInfo);
+      const fresh = this.renderFragment(fragment, contextBase, sdtBoundary, betweenInfo, resolvedItem);
       pageEl.insertBefore(fresh, pageEl.children[index] ?? null);
       nextFragments.push({
         key,
@@ -2642,7 +2613,14 @@ export class DomPainter {
     const betweenBorderFlags = computeBetweenBorderFlags(page.fragments, this.blockLookup);
     const fragmentStates: FragmentDomState[] = page.fragments.map((fragment, index) => {
       const sdtBoundary = sdtBoundaries.get(index);
-      const fragmentEl = this.renderFragment(fragment, contextBase, sdtBoundary, betweenBorderFlags.get(index));
+      const resolvedItem = this.getResolvedFragmentItem(pageIndex, index);
+      const fragmentEl = this.renderFragment(
+        fragment,
+        contextBase,
+        sdtBoundary,
+        betweenBorderFlags.get(index),
+        resolvedItem,
+      );
       el.appendChild(fragmentEl);
       return {
         key: fragmentKey(fragment),
@@ -2689,21 +2667,22 @@ export class DomPainter {
     context: FragmentRenderContext,
     sdtBoundary?: SdtBoundaryOptions,
     betweenInfo?: BetweenBorderInfo,
+    resolvedItem?: ResolvedFragmentItem,
   ): HTMLElement {
     if (fragment.kind === 'para') {
-      return this.renderParagraphFragment(fragment, context, sdtBoundary, betweenInfo);
+      return this.renderParagraphFragment(fragment, context, sdtBoundary, betweenInfo, resolvedItem);
     }
     if (fragment.kind === 'list-item') {
-      return this.renderListItemFragment(fragment, context, sdtBoundary, betweenInfo);
+      return this.renderListItemFragment(fragment, context, sdtBoundary, betweenInfo, resolvedItem);
     }
     if (fragment.kind === 'image') {
-      return this.renderImageFragment(fragment, context);
+      return this.renderImageFragment(fragment, context, resolvedItem);
     }
     if (fragment.kind === 'drawing') {
-      return this.renderDrawingFragment(fragment, context);
+      return this.renderDrawingFragment(fragment, context, resolvedItem);
     }
     if (fragment.kind === 'table') {
-      return this.renderTableFragment(fragment, context, sdtBoundary);
+      return this.renderTableFragment(fragment, context, sdtBoundary, resolvedItem);
     }
     throw new Error(`DomPainter: unsupported fragment kind ${(fragment as Fragment).kind}`);
   }
@@ -2722,6 +2701,7 @@ export class DomPainter {
     context: FragmentRenderContext,
     sdtBoundary?: SdtBoundaryOptions,
     betweenInfo?: BetweenBorderInfo,
+    resolvedItem?: ResolvedFragmentItem,
   ): HTMLElement {
     try {
       const lookup = this.blockLookup.get(fragment.blockId);
@@ -2736,6 +2716,7 @@ export class DomPainter {
       const block = lookup.block as ParagraphBlock;
       const measure = lookup.measure as ParagraphMeasure;
       const wordLayout = isMinimalWordLayout(block.attrs?.wordLayout) ? block.attrs.wordLayout : undefined;
+      const content = resolvedItem?.content;
 
       const fragmentEl = this.doc.createElement('div');
       fragmentEl.classList.add(CLASS_NAMES.fragment);
@@ -2759,7 +2740,11 @@ export class DomPainter {
           ? { ...fragmentStyles, overflow: 'visible' }
           : fragmentStyles;
       applyStyles(fragmentEl, styles);
-      this.applyFragmentFrame(fragmentEl, fragment, context.section);
+      if (resolvedItem) {
+        this.applyResolvedFragmentFrame(fragmentEl, resolvedItem, fragment, context.section);
+      } else {
+        this.applyFragmentFrame(fragmentEl, fragment, context.section);
+      }
 
       // Add TOC-specific styling class
       if (isTocEntry) {
@@ -2801,11 +2786,34 @@ export class DomPainter {
       applySdtContainerStyling(this.doc, fragmentEl, block.attrs?.sdt, block.attrs?.containerSdt, sdtBoundary);
 
       // Render drop cap if present (only on the first fragment, not continuation)
-      const dropCapDescriptor = block.attrs?.dropCapDescriptor;
-      const dropCapMeasure = measure.dropCap;
-      if (dropCapDescriptor && dropCapMeasure && !fragment.continuesFromPrev) {
-        const dropCapEl = this.renderDropCap(dropCapDescriptor, dropCapMeasure);
+      if (content?.dropCap) {
+        const dc = content.dropCap;
+        const dropCapEl = this.renderDropCap(
+          {
+            mode: dc.mode,
+            run: {
+              text: dc.text,
+              fontFamily: dc.fontFamily,
+              fontSize: dc.fontSize,
+              bold: dc.bold,
+              italic: dc.italic,
+              color: dc.color,
+              position: dc.position,
+            },
+            lines: 0,
+          },
+          dc.width != null && dc.height != null
+            ? { width: dc.width, height: dc.height, lines: 0, mode: dc.mode }
+            : undefined,
+        );
         fragmentEl.appendChild(dropCapEl);
+      } else {
+        const dropCapDescriptor = block.attrs?.dropCapDescriptor;
+        const dropCapMeasure = measure.dropCap;
+        if (dropCapDescriptor && dropCapMeasure && !fragment.continuesFromPrev) {
+          const dropCapEl = this.renderDropCap(dropCapDescriptor, dropCapMeasure);
+          fragmentEl.appendChild(dropCapEl);
+        }
       }
 
       // Remove fragment-level indent so line-level indent handling doesn't double-apply.
@@ -2816,24 +2824,138 @@ export class DomPainter {
       if (fragmentEl.style.marginRight) fragmentEl.style.removeProperty('margin-right');
       if (fragmentEl.style.textIndent) fragmentEl.style.removeProperty('text-indent');
 
-      const paraIndent = block.attrs?.indent;
-      const paraIndentLeft = paraIndent?.left ?? 0;
-      const paraIndentRight = paraIndent?.right ?? 0;
-      // Word quirk: justified paragraphs ignore first-line indent. The pm-adapter sets // => This is not true
-      // suppressFirstLineIndent=true for these cases.
-      const suppressFirstLineIndent = (block.attrs as Record<string, unknown>)?.suppressFirstLineIndent === true;
-      const firstLineOffset = suppressFirstLineIndent ? 0 : (paraIndent?.firstLine ?? 0) - (paraIndent?.hanging ?? 0);
+      if (content) {
+        // ── Resolved path: read pre-computed values from ResolvedParagraphContent ──
+        const resolvedMarker = content.marker;
 
-      // Check if the paragraph ends with a lineBreak run.
-      // In Word, justified text stretches all lines EXCEPT the true last line of a paragraph.
-      // However, if the paragraph ends with a <w:br/> (lineBreak), the visible text before
-      // the break should still be justified because the "last line" is the empty line after the break.
-      const lastRun = block.runs.length > 0 ? block.runs[block.runs.length - 1] : null;
-      const paragraphEndsWithLineBreak = lastRun?.kind === 'lineBreak';
+        content.lines.forEach((resolvedLine) => {
+          const lineEl = this.renderLine(
+            block,
+            resolvedLine.line,
+            context,
+            resolvedLine.availableWidth,
+            resolvedLine.lineIndex,
+            resolvedLine.skipJustify,
+            resolvedLine.resolvedListTextStartPx,
+            resolvedLine.indentOffset,
+          );
 
-      const listFirstLineTextStartPx =
-        !fragment.continuesFromPrev && fragment.markerWidth && wordLayout?.marker
-          ? resolvePainterListTextStartPx({
+          // Apply pre-computed indent values
+          if (!resolvedLine.isListFirstLine) {
+            if (resolvedLine.paddingLeftPx > 0) {
+              lineEl.style.paddingLeft = `${resolvedLine.paddingLeftPx}px`;
+            }
+            if (resolvedLine.textIndentPx !== 0) {
+              lineEl.style.textIndent = `${resolvedLine.textIndentPx}px`;
+            } else if (resolvedLine.lineIndex > 0 || content.continuesFromPrev) {
+              // Body lines: reset textIndent to 0 if firstLineOffset would have been set
+              // (mirrors the legacy `else if (firstLineOffset && !isListFirstLine)` branch)
+              const paraIndent = block.attrs?.indent;
+              const suppressFLI = (block.attrs as Record<string, unknown>)?.suppressFirstLineIndent === true;
+              const flo = suppressFLI ? 0 : (paraIndent?.firstLine ?? 0) - (paraIndent?.hanging ?? 0);
+              if (flo && !resolvedLine.isListFirstLine) {
+                lineEl.style.textIndent = '0px';
+              }
+            }
+          }
+          if (resolvedLine.paddingRightPx > 0) {
+            lineEl.style.paddingRight = `${resolvedLine.paddingRightPx}px`;
+          }
+
+          // Render marker on list first line
+          if (resolvedLine.isListFirstLine && resolvedMarker) {
+            lineEl.style.paddingLeft = `${resolvedMarker.firstLinePaddingLeftPx}px`;
+
+            if (!resolvedMarker.vanish) {
+              const markerContainer = this.doc!.createElement('span');
+              markerContainer.style.display = 'inline-block';
+              markerContainer.style.wordSpacing = '0px';
+
+              const markerEl = this.doc!.createElement('span');
+              markerEl.classList.add('superdoc-paragraph-marker');
+              markerEl.textContent = resolvedMarker.text;
+              markerEl.style.pointerEvents = 'none';
+
+              markerContainer.style.position = 'relative';
+              if (resolvedMarker.justification === 'right') {
+                markerContainer.style.position = 'absolute';
+                markerContainer.style.left = `${resolvedMarker.markerStartPx}px`;
+              } else if (resolvedMarker.justification === 'center') {
+                markerContainer.style.position = 'absolute';
+                markerContainer.style.left = `${resolvedMarker.markerStartPx - (resolvedMarker.centerPaddingAdjustPx ?? 0)}px`;
+                lineEl.style.paddingLeft =
+                  parseFloat(lineEl.style.paddingLeft) + (resolvedMarker.centerPaddingAdjustPx ?? 0) + 'px';
+              }
+
+              markerEl.style.fontFamily =
+                toCssFontFamily(resolvedMarker.run.fontFamily) ?? resolvedMarker.run.fontFamily;
+              markerEl.style.fontSize = `${resolvedMarker.run.fontSize}px`;
+              markerEl.style.fontWeight = resolvedMarker.run.bold ? 'bold' : '';
+              markerEl.style.fontStyle = resolvedMarker.run.italic ? 'italic' : '';
+              if (resolvedMarker.run.color) {
+                markerEl.style.color = resolvedMarker.run.color;
+              }
+              if (resolvedMarker.run.letterSpacing != null) {
+                markerEl.style.letterSpacing = `${resolvedMarker.run.letterSpacing}px`;
+              }
+              markerContainer.appendChild(markerEl);
+
+              if (resolvedMarker.suffix === 'tab') {
+                const tabEl = this.doc!.createElement('span');
+                tabEl.className = 'superdoc-tab';
+                tabEl.innerHTML = '&nbsp;';
+                tabEl.style.display = 'inline-block';
+                tabEl.style.wordSpacing = '0px';
+                tabEl.style.width = `${resolvedMarker.suffixWidthPx}px`;
+                lineEl.prepend(tabEl);
+              } else if (resolvedMarker.suffix === 'space') {
+                const spaceEl = this.doc!.createElement('span');
+                spaceEl.classList.add('superdoc-marker-suffix-space');
+                spaceEl.style.wordSpacing = '0px';
+                spaceEl.textContent = '\u00A0';
+                lineEl.prepend(spaceEl);
+              }
+              lineEl.prepend(markerContainer);
+            }
+          }
+          this.capturePaintSnapshotLine(lineEl, context, {
+            inTableFragment: false,
+            inTableParagraph: false,
+          });
+          fragmentEl.appendChild(lineEl);
+        });
+      } else {
+        // ── Legacy path: compute everything from block attrs and measure ──
+        const paraIndent = block.attrs?.indent;
+        const paraIndentLeft = paraIndent?.left ?? 0;
+        const paraIndentRight = paraIndent?.right ?? 0;
+        const suppressFirstLineIndent = (block.attrs as Record<string, unknown>)?.suppressFirstLineIndent === true;
+        const firstLineOffset = suppressFirstLineIndent ? 0 : (paraIndent?.firstLine ?? 0) - (paraIndent?.hanging ?? 0);
+
+        const lastRun = block.runs.length > 0 ? block.runs[block.runs.length - 1] : null;
+        const paragraphEndsWithLineBreak = lastRun?.kind === 'lineBreak';
+
+        const listFirstLineTextStartPx =
+          !fragment.continuesFromPrev && fragment.markerWidth && wordLayout?.marker
+            ? resolvePainterListTextStartPx({
+                wordLayout,
+                indentLeftPx: paraIndentLeft,
+                hangingIndentPx: paraIndent?.hanging ?? 0,
+                firstLineIndentPx: paraIndent?.firstLine ?? 0,
+                markerTextWidthPx: fragment.markerTextWidth,
+              })
+            : undefined;
+
+        const shouldUseSharedInlinePrefixGeometry =
+          !fragment.continuesFromPrev &&
+          fragment.markerWidth &&
+          wordLayout?.marker?.justification === 'left' &&
+          wordLayout.firstLineIndentMode !== true &&
+          typeof fragment.markerTextWidth === 'number' &&
+          Number.isFinite(fragment.markerTextWidth) &&
+          fragment.markerTextWidth >= 0;
+        const listFirstLineMarkerGeometry = shouldUseSharedInlinePrefixGeometry
+          ? resolvePainterListMarkerGeometry({
               wordLayout,
               indentLeftPx: paraIndentLeft,
               hangingIndentPx: paraIndent?.hanging ?? 0,
@@ -2842,270 +2964,172 @@ export class DomPainter {
             })
           : undefined;
 
-      const shouldUseSharedInlinePrefixGeometry =
-        !fragment.continuesFromPrev &&
-        fragment.markerWidth &&
-        wordLayout?.marker?.justification === 'left' &&
-        wordLayout.firstLineIndentMode !== true &&
-        typeof fragment.markerTextWidth === 'number' &&
-        Number.isFinite(fragment.markerTextWidth) &&
-        fragment.markerTextWidth >= 0;
-      const listFirstLineMarkerGeometry = shouldUseSharedInlinePrefixGeometry
-        ? resolvePainterListMarkerGeometry({
-            wordLayout,
-            indentLeftPx: paraIndentLeft,
-            hangingIndentPx: paraIndent?.hanging ?? 0,
-            firstLineIndentPx: paraIndent?.firstLine ?? 0,
-            markerTextWidthPx: fragment.markerTextWidth,
-          })
-        : undefined;
+        let listTabWidth = 0;
+        let markerStartPos = 0;
+        if (!fragment.continuesFromPrev && fragment.markerWidth && wordLayout?.marker) {
+          const markerTextWidth = fragment.markerTextWidth!;
+          const anchorPoint = paraIndentLeft - (paraIndent?.hanging ?? 0) + (paraIndent?.firstLine ?? 0);
+          const markerJustification = wordLayout.marker.justification ?? 'left';
+          let currentPos: number;
+          if (markerJustification === 'left') {
+            markerStartPos = anchorPoint;
+            currentPos = markerStartPos + markerTextWidth;
+          } else if (markerJustification === 'right') {
+            markerStartPos = anchorPoint - markerTextWidth;
+            currentPos = anchorPoint;
+          } else {
+            markerStartPos = anchorPoint - markerTextWidth / 2;
+            currentPos = markerStartPos + markerTextWidth;
+          }
 
-      // Pre-calculate marker geometry used later when painting the inline prefix.
-      let listTabWidth = 0;
-      let markerStartPos = 0;
-      if (!fragment.continuesFromPrev && fragment.markerWidth && wordLayout?.marker) {
-        const markerTextWidth = fragment.markerTextWidth!;
-        const anchorPoint = paraIndentLeft - (paraIndent?.hanging ?? 0) + (paraIndent?.firstLine ?? 0);
-        const markerJustification = wordLayout.marker.justification ?? 'left';
-        let currentPos: number;
-        if (markerJustification === 'left') {
-          markerStartPos = anchorPoint;
-          currentPos = markerStartPos + markerTextWidth;
-        } else if (markerJustification === 'right') {
-          markerStartPos = anchorPoint - markerTextWidth;
-          currentPos = anchorPoint;
-        } else {
-          markerStartPos = anchorPoint - markerTextWidth / 2;
-          currentPos = markerStartPos + markerTextWidth;
+          const suffix = wordLayout.marker.suffix ?? 'tab';
+          if (listFirstLineMarkerGeometry && (suffix === 'tab' || suffix === 'space')) {
+            listTabWidth = listFirstLineMarkerGeometry.suffixWidthPx;
+          } else if (suffix === 'tab') {
+            listTabWidth = computeTabWidth(
+              currentPos,
+              markerJustification,
+              wordLayout.tabsPx,
+              paraIndent?.hanging,
+              paraIndent?.firstLine,
+              paraIndentLeft,
+            );
+          } else if (suffix === 'space') {
+            listTabWidth = 4;
+          }
         }
 
-        const suffix = wordLayout.marker.suffix ?? 'tab';
-        if (listFirstLineMarkerGeometry && (suffix === 'tab' || suffix === 'space')) {
-          listTabWidth = listFirstLineMarkerGeometry.suffixWidthPx;
-        } else if (suffix === 'tab') {
-          listTabWidth = computeTabWidth(
-            currentPos,
-            markerJustification,
-            wordLayout.tabsPx,
-            paraIndent?.hanging,
-            paraIndent?.firstLine,
-            paraIndentLeft,
+        lines.forEach((line, index) => {
+          const hasExplicitSegmentPositioning = line.segments?.some((segment) => segment.x !== undefined) === true;
+          const hasListFirstLineMarker =
+            index === 0 && !fragment.continuesFromPrev && fragment.markerWidth && wordLayout?.marker;
+          const shouldUseResolvedListTextStart =
+            hasListFirstLineMarker && hasExplicitSegmentPositioning && listFirstLineTextStartPx != null;
+
+          const positiveIndentReduction = Math.max(0, paraIndentLeft) + Math.max(0, paraIndentRight);
+          const fallbackAvailableWidth = Math.max(0, fragment.width - positiveIndentReduction);
+          let availableWidthOverride =
+            line.maxWidth != null ? Math.min(line.maxWidth, fallbackAvailableWidth) : fallbackAvailableWidth;
+
+          if (shouldUseResolvedListTextStart) {
+            availableWidthOverride = fragment.width - listFirstLineTextStartPx - Math.max(0, paraIndentRight);
+          }
+
+          const isLastLineOfFragment = index === lines.length - 1;
+          const isLastLineOfParagraph = isLastLineOfFragment && !fragment.continuesOnNext;
+          const shouldSkipJustifyForLastLine = isLastLineOfParagraph && !paragraphEndsWithLineBreak;
+
+          const lineEl = this.renderLine(
+            block,
+            line,
+            context,
+            availableWidthOverride,
+            fragment.fromLine + index,
+            shouldSkipJustifyForLastLine,
+            shouldUseResolvedListTextStart ? listFirstLineTextStartPx : undefined,
           );
-        } else if (suffix === 'space') {
-          listTabWidth = 4;
-        }
-      }
 
-      lines.forEach((line, index) => {
-        const hasExplicitSegmentPositioning = line.segments?.some((segment) => segment.x !== undefined) === true;
-        const hasListFirstLineMarker =
-          index === 0 && !fragment.continuesFromPrev && fragment.markerWidth && wordLayout?.marker;
-        const shouldUseResolvedListTextStart =
-          hasListFirstLineMarker && hasExplicitSegmentPositioning && listFirstLineTextStartPx != null;
+          const isListFirstLine = Boolean(hasListFirstLineMarker && fragment.markerTextWidth);
+          const isFirstLine = index === 0 && !fragment.continuesFromPrev;
 
-        // Calculate available width from fragment dimensions (the actual rendered width).
-        // This is the ground truth for justify calculations since it matches what's visible.
-        // Only subtract positive indents - negative indents already expand fragment.width in layout
-        const positiveIndentReduction = Math.max(0, paraIndentLeft) + Math.max(0, paraIndentRight);
-        const fallbackAvailableWidth = Math.max(0, fragment.width - positiveIndentReduction);
-        // Use line.maxWidth if available (accounts for drop caps, exclusion zones), but cap it at
-        // fallbackAvailableWidth to handle cases where measurement used a different width than layout
-        // (e.g., paragraph measured at full page width but laid out in narrower column).
-        let availableWidthOverride =
-          line.maxWidth != null ? Math.min(line.maxWidth, fallbackAvailableWidth) : fallbackAvailableWidth;
-
-        // Only explicit-positioned list first lines need a painter-side width override.
-        // Inline list first lines already have the correct measured width in `line.maxWidth`,
-        // and second-guessing that width causes justified spacing regressions.
-        if (shouldUseResolvedListTextStart) {
-          availableWidthOverride = fragment.width - listFirstLineTextStartPx - Math.max(0, paraIndentRight);
-        }
-
-        // Determine if this is the true last line of the paragraph that should skip justification.
-        // Skip justify if: this is the last line of the last fragment AND no trailing lineBreak.
-        //
-        // IMPORTANT: List paragraphs (paragraphs with fragment.markerWidth and wordLayout.marker)
-        // SHOULD be justified per MS Word specification when alignment is 'justify'. Do NOT add
-        // an isListParagraph check here - the last line rule applies equally to list and non-list
-        // paragraphs (both skip justification on the final line unless it ends with lineBreak).
-        const isLastLineOfFragment = index === lines.length - 1;
-        const isLastLineOfParagraph = isLastLineOfFragment && !fragment.continuesOnNext;
-        const shouldSkipJustifyForLastLine = isLastLineOfParagraph && !paragraphEndsWithLineBreak;
-
-        const lineEl = this.renderLine(
-          block,
-          line,
-          context,
-          availableWidthOverride,
-          fragment.fromLine + index,
-          shouldSkipJustifyForLastLine,
-          shouldUseResolvedListTextStart ? listFirstLineTextStartPx : undefined,
-        );
-
-        // List first lines handle indentation via marker positioning and tab stops,
-        // not CSS padding/text-indent. This matches Word's rendering model.
-        const isListFirstLine = Boolean(hasListFirstLineMarker && fragment.markerTextWidth);
-
-        /**
-         * Identifies first lines that require special indent handling.
-         * This includes both hanging indents (negative firstLineOffset) and positive firstLine indents.
-         * When combined with explicit segment positioning, we must adjust paddingLeft instead of
-         * using textIndent, since absolutely positioned segments are not affected by textIndent.
-         */
-        const isFirstLine = index === 0 && !fragment.continuesFromPrev;
-
-        // Apply paragraph indent via padding (skip for list first lines)
-        if (!isListFirstLine) {
-          /**
-           * Special handling for first lines with explicit segment positioning.
-           *
-           * Normally we implement first-line/hanging indents with:
-           * - paddingLeft = leftIndent
-           * - textIndent = firstLine - hanging (positive for firstLine, negative for hanging)
-           *
-           * However, when tabs are present, segments have explicit X positions calculated
-           * during layout that are relative to the content area start. Since these segments
-           * use absolute positioning, CSS textIndent doesn't affect them.
-           *
-           * Therefore, we must incorporate the firstLineOffset into paddingLeft to match
-           * where the absolutely positioned segments expect to start.
-           *
-           * Examples:
-           * - leftIndent=360, hanging=360 (firstLineOffset=-360)
-           *   Normal: paddingLeft=360px, textIndent=-360px → first line content at 0px
-           *   With tabs: paddingLeft=0px, no textIndent → segments positioned correctly
-           *
-           * - leftIndent=360, firstLine=720 (firstLineOffset=+720)
-           *   Normal: paddingLeft=360px, textIndent=720px → first line content at 1080px
-           *   With tabs: paddingLeft=1080px, no textIndent → segments positioned correctly
-           */
-          if (hasExplicitSegmentPositioning) {
-            // When segments have explicit X positions (from tabs), they are absolutely positioned.
-            // Absolutely positioned elements ignore padding, so we must NOT set paddingLeft.
-            // The segment X positions already include the paragraph indent from layout calculation.
-            // For first lines with firstLineOffset, adjust the starting position.
-            if (isFirstLine && firstLineOffset !== 0) {
-              // For negative left indent, fragment position is already adjusted in layout engine.
-              // Only apply padding for the firstLineOffset (relative to the paragraph indent).
-              const effectiveLeftIndent = paraIndentLeft < 0 ? 0 : paraIndentLeft;
-              const adjustedPadding = effectiveLeftIndent + firstLineOffset;
-              if (adjustedPadding > 0) {
-                lineEl.style.paddingLeft = `${adjustedPadding}px`;
+          if (!isListFirstLine) {
+            if (hasExplicitSegmentPositioning) {
+              if (isFirstLine && firstLineOffset !== 0) {
+                const effectiveLeftIndent = paraIndentLeft < 0 ? 0 : paraIndentLeft;
+                const adjustedPadding = effectiveLeftIndent + firstLineOffset;
+                if (adjustedPadding > 0) {
+                  lineEl.style.paddingLeft = `${adjustedPadding}px`;
+                }
               }
-              // Note: negative adjustedPadding (from hanging indent) is handled by textIndent below
+            } else if (paraIndentLeft && paraIndentLeft > 0) {
+              lineEl.style.paddingLeft = `${paraIndentLeft}px`;
+            } else if (
+              !isFirstLine &&
+              paraIndent?.hanging &&
+              paraIndent.hanging > 0 &&
+              !(paraIndentLeft != null && paraIndentLeft < 0)
+            ) {
+              lineEl.style.paddingLeft = `${paraIndent.hanging}px`;
             }
-            // Otherwise, don't set paddingLeft - segment positions handle indentation
-          } else if (paraIndentLeft && paraIndentLeft > 0) {
-            // Only apply positive left indent as padding.
-            // Negative left indent is handled by fragment positioning in layout engine.
-            lineEl.style.paddingLeft = `${paraIndentLeft}px`;
-          } else if (
-            !isFirstLine &&
-            paraIndent?.hanging &&
-            paraIndent.hanging > 0 &&
-            // Only apply hanging padding when left indent is NOT negative.
-            // When left indent is negative, the fragment position already accounts for it.
-            // Adding padding here would shift body lines right, causing right-side overflow.
-            !(paraIndentLeft != null && paraIndentLeft < 0)
-          ) {
-            // Body lines with hanging indent need paddingLeft = hanging when left indent is non-negative.
-            // First line doesn't get this padding because it "hangs" (starts further left).
-            lineEl.style.paddingLeft = `${paraIndent.hanging}px`;
           }
-        }
-        if (paraIndentRight && paraIndentRight > 0) {
-          // Only apply positive right indent as padding.
-          // Negative right indent is handled by fragment positioning in layout engine.
-          lineEl.style.paddingRight = `${paraIndentRight}px`;
-        }
-        // Apply first-line/hanging text-indent (skip for list first lines and lines with explicit positioning)
-        // When using explicit segment positioning, segments are absolutely positioned and textIndent
-        // has no effect, so we skip it to avoid confusion.
-        if (!fragment.continuesFromPrev && index === 0 && firstLineOffset && !isListFirstLine) {
-          if (!hasExplicitSegmentPositioning) {
-            lineEl.style.textIndent = `${firstLineOffset}px`;
+          if (paraIndentRight && paraIndentRight > 0) {
+            lineEl.style.paddingRight = `${paraIndentRight}px`;
           }
-        } else if (firstLineOffset && !isListFirstLine) {
-          lineEl.style.textIndent = '0px';
-        }
-
-        if (isListFirstLine) {
-          const marker = wordLayout?.marker;
-          if (!marker) {
-            return;
+          if (!fragment.continuesFromPrev && index === 0 && firstLineOffset && !isListFirstLine) {
+            if (!hasExplicitSegmentPositioning) {
+              lineEl.style.textIndent = `${firstLineOffset}px`;
+            }
+          } else if (firstLineOffset && !isListFirstLine) {
+            lineEl.style.textIndent = '0px';
           }
-          lineEl.style.paddingLeft = `${paraIndentLeft + (paraIndent?.firstLine ?? 0) - (paraIndent?.hanging ?? 0)}px`;
 
-          // Skip marker rendering when hidden by vanish property (preserves list indentation)
-          if (!marker.run.vanish) {
-            const markerContainer = this.doc!.createElement('span');
-            markerContainer.style.display = 'inline-block';
-            // Justification is implemented via `word-spacing` on the line element. The list marker (and its
-            // tab/space suffix) must not inherit this spacing or it will shift the text start and can
-            // cause overflow for justified list paragraphs.
-            markerContainer.style.wordSpacing = '0px';
-
-            const markerEl = this.doc!.createElement('span');
-            markerEl.classList.add('superdoc-paragraph-marker');
-            markerEl.textContent = marker.markerText ?? '';
-            markerEl.style.pointerEvents = 'none';
-
-            // Left-justified markers stay inline to share flow with the tab spacer.
-            // Other justifications use absolute positioning.
-            const markerJustification = marker.justification ?? 'left';
-
-            markerContainer.style.position = 'relative';
-            if (markerJustification === 'right') {
-              markerContainer.style.position = 'absolute';
-              markerContainer.style.left = `${markerStartPos}px`;
-            } else if (markerJustification === 'center') {
-              markerContainer.style.position = 'absolute';
-              markerContainer.style.left = `${markerStartPos - fragment.markerTextWidth! / 2}px`;
-              lineEl.style.paddingLeft = parseFloat(lineEl.style.paddingLeft) + fragment.markerTextWidth! / 2 + 'px';
+          if (isListFirstLine) {
+            const marker = wordLayout?.marker;
+            if (!marker) {
+              return;
             }
+            lineEl.style.paddingLeft = `${paraIndentLeft + (paraIndent?.firstLine ?? 0) - (paraIndent?.hanging ?? 0)}px`;
 
-            // Apply marker run styling with font fallback chain
-            markerEl.style.fontFamily = toCssFontFamily(marker.run.fontFamily) ?? marker.run.fontFamily;
-            markerEl.style.fontSize = `${marker.run.fontSize}px`;
-            markerEl.style.fontWeight = marker.run.bold ? 'bold' : '';
-            markerEl.style.fontStyle = marker.run.italic ? 'italic' : '';
-            if (marker.run.color) {
-              markerEl.style.color = marker.run.color;
+            if (!marker.run.vanish) {
+              const markerContainer = this.doc!.createElement('span');
+              markerContainer.style.display = 'inline-block';
+              markerContainer.style.wordSpacing = '0px';
+
+              const markerEl = this.doc!.createElement('span');
+              markerEl.classList.add('superdoc-paragraph-marker');
+              markerEl.textContent = marker.markerText ?? '';
+              markerEl.style.pointerEvents = 'none';
+
+              const markerJustification = marker.justification ?? 'left';
+
+              markerContainer.style.position = 'relative';
+              if (markerJustification === 'right') {
+                markerContainer.style.position = 'absolute';
+                markerContainer.style.left = `${markerStartPos}px`;
+              } else if (markerJustification === 'center') {
+                markerContainer.style.position = 'absolute';
+                markerContainer.style.left = `${markerStartPos - fragment.markerTextWidth! / 2}px`;
+                lineEl.style.paddingLeft = parseFloat(lineEl.style.paddingLeft) + fragment.markerTextWidth! / 2 + 'px';
+              }
+
+              markerEl.style.fontFamily = toCssFontFamily(marker.run.fontFamily) ?? marker.run.fontFamily;
+              markerEl.style.fontSize = `${marker.run.fontSize}px`;
+              markerEl.style.fontWeight = marker.run.bold ? 'bold' : '';
+              markerEl.style.fontStyle = marker.run.italic ? 'italic' : '';
+              if (marker.run.color) {
+                markerEl.style.color = marker.run.color;
+              }
+              if (marker.run.letterSpacing != null) {
+                markerEl.style.letterSpacing = `${marker.run.letterSpacing}px`;
+              }
+              markerContainer.appendChild(markerEl);
+
+              const suffix = marker.suffix ?? 'tab';
+              if (suffix === 'tab') {
+                const tabEl = this.doc!.createElement('span');
+                tabEl.className = 'superdoc-tab';
+                tabEl.innerHTML = '&nbsp;';
+                tabEl.style.display = 'inline-block';
+                tabEl.style.wordSpacing = '0px';
+                tabEl.style.width = `${listTabWidth}px`;
+                lineEl.prepend(tabEl);
+              } else if (suffix === 'space') {
+                const spaceEl = this.doc!.createElement('span');
+                spaceEl.classList.add('superdoc-marker-suffix-space');
+                spaceEl.style.wordSpacing = '0px';
+                spaceEl.textContent = '\u00A0';
+                lineEl.prepend(spaceEl);
+              }
+              lineEl.prepend(markerContainer);
             }
-            if (marker.run.letterSpacing != null) {
-              markerEl.style.letterSpacing = `${marker.run.letterSpacing}px`;
-            }
-            markerContainer.appendChild(markerEl);
-
-            const suffix = marker.suffix ?? 'tab';
-            if (suffix === 'tab') {
-              const tabEl = this.doc!.createElement('span');
-              tabEl.className = 'superdoc-tab';
-              tabEl.innerHTML = '&nbsp;';
-              tabEl.style.display = 'inline-block';
-              tabEl.style.wordSpacing = '0px';
-              tabEl.style.width = `${listTabWidth}px`;
-
-              lineEl.prepend(tabEl);
-            } else if (suffix === 'space') {
-              // Insert a non-breaking space in the inline flow to separate marker and text.
-              // Wrap it so it can opt out of inherited `word-spacing` used for justification.
-              const spaceEl = this.doc!.createElement('span');
-              spaceEl.classList.add('superdoc-marker-suffix-space');
-              spaceEl.style.wordSpacing = '0px';
-              spaceEl.textContent = '\u00A0';
-
-              lineEl.prepend(spaceEl);
-            }
-            lineEl.prepend(markerContainer);
           }
-        }
-        this.capturePaintSnapshotLine(lineEl, context, {
-          inTableFragment: false,
-          inTableParagraph: false,
+          this.capturePaintSnapshotLine(lineEl, context, {
+            inTableFragment: false,
+            inTableParagraph: false,
+          });
+          fragmentEl.appendChild(lineEl);
         });
-        fragmentEl.appendChild(lineEl);
-      });
+      }
 
       return fragmentEl;
     } catch (error) {
@@ -3207,6 +3231,7 @@ export class DomPainter {
     context: FragmentRenderContext,
     sdtBoundary?: SdtBoundaryOptions,
     betweenInfo?: BetweenBorderInfo,
+    resolvedItem?: ResolvedFragmentItem,
   ): HTMLElement {
     try {
       const lookup = this.blockLookup.get(fragment.blockId);
@@ -3229,10 +3254,14 @@ export class DomPainter {
       const fragmentEl = this.doc.createElement('div');
       fragmentEl.classList.add(CLASS_NAMES.fragment, `${CLASS_NAMES.fragment}-list-item`);
       applyStyles(fragmentEl, fragmentStyles);
-      fragmentEl.style.left = `${fragment.x - fragment.markerWidth}px`;
-      fragmentEl.style.top = `${fragment.y}px`;
-      fragmentEl.style.width = `${fragment.markerWidth + fragment.width}px`;
-      fragmentEl.dataset.blockId = fragment.blockId;
+      if (resolvedItem) {
+        this.applyResolvedListItemWrapperFrame(fragmentEl, fragment, resolvedItem, context.section);
+      } else {
+        fragmentEl.style.left = `${fragment.x - fragment.markerWidth}px`;
+        fragmentEl.style.top = `${fragment.y}px`;
+        fragmentEl.style.width = `${fragment.markerWidth + fragment.width}px`;
+        fragmentEl.dataset.blockId = fragment.blockId;
+      }
       fragmentEl.dataset.itemId = fragment.itemId;
 
       const paragraphMetadata = item.paragraph.attrs?.sdt;
@@ -3339,7 +3368,11 @@ export class DomPainter {
     }
   }
 
-  private renderImageFragment(fragment: ImageFragment, context: FragmentRenderContext): HTMLElement {
+  private renderImageFragment(
+    fragment: ImageFragment,
+    context: FragmentRenderContext,
+    resolvedItem?: ResolvedFragmentItem,
+  ): HTMLElement {
     try {
       const lookup = this.blockLookup.get(fragment.blockId);
       if (!lookup || lookup.block.kind !== 'image' || lookup.measure.kind !== 'image') {
@@ -3355,15 +3388,15 @@ export class DomPainter {
       const fragmentEl = this.doc.createElement('div');
       fragmentEl.classList.add(CLASS_NAMES.fragment, DOM_CLASS_NAMES.IMAGE_FRAGMENT);
       applyStyles(fragmentEl, fragmentStyles);
-      this.applyFragmentFrame(fragmentEl, fragment, context.section);
-      fragmentEl.style.height = `${fragment.height}px`;
+      if (resolvedItem) {
+        this.applyResolvedFragmentFrame(fragmentEl, resolvedItem, fragment, context.section);
+      } else {
+        this.applyFragmentFrame(fragmentEl, fragment, context.section);
+        fragmentEl.style.height = `${fragment.height}px`;
+        this.applyFragmentWrapperZIndex(fragmentEl, fragment);
+      }
       this.applySdtDataset(fragmentEl, block.attrs?.sdt);
       this.applyContainerSdtDataset(fragmentEl, block.attrs?.containerSdt);
-
-      // Apply z-index for anchored images
-      if (fragment.isAnchored && fragment.zIndex != null) {
-        fragmentEl.style.zIndex = String(fragment.zIndex);
-      }
 
       // Add block ID for PM transaction targeting
       if (block.id) {
@@ -3449,7 +3482,11 @@ export class DomPainter {
     }
   }
 
-  private renderDrawingFragment(fragment: DrawingFragment, context: FragmentRenderContext): HTMLElement {
+  private renderDrawingFragment(
+    fragment: DrawingFragment,
+    context: FragmentRenderContext,
+    resolvedItem?: ResolvedFragmentItem,
+  ): HTMLElement {
     try {
       const lookup = this.blockLookup.get(fragment.blockId);
       if (!lookup || lookup.block.kind !== 'drawing' || lookup.measure.kind !== 'drawing') {
@@ -3465,14 +3502,15 @@ export class DomPainter {
       const fragmentEl = this.doc.createElement('div');
       fragmentEl.classList.add(CLASS_NAMES.fragment, 'superdoc-drawing-fragment');
       applyStyles(fragmentEl, fragmentStyles);
-      this.applyFragmentFrame(fragmentEl, fragment, context.section);
-      fragmentEl.style.height = `${fragment.height}px`;
+      if (resolvedItem) {
+        this.applyResolvedFragmentFrame(fragmentEl, resolvedItem, fragment, context.section);
+      } else {
+        this.applyFragmentFrame(fragmentEl, fragment, context.section);
+        fragmentEl.style.height = `${fragment.height}px`;
+        this.applyFragmentWrapperZIndex(fragmentEl, fragment);
+      }
       fragmentEl.style.position = 'absolute';
       fragmentEl.style.overflow = 'hidden';
-
-      if (fragment.isAnchored && fragment.zIndex != null) {
-        fragmentEl.style.zIndex = String(fragment.zIndex);
-      }
 
       const innerWrapper = this.doc.createElement('div');
       innerWrapper.classList.add('superdoc-drawing-inner');
@@ -4285,6 +4323,7 @@ export class DomPainter {
     fragment: TableFragment,
     context: FragmentRenderContext,
     sdtBoundary?: SdtBoundaryOptions,
+    resolvedItem?: ResolvedFragmentItem,
   ): HTMLElement {
     if (!this.doc) {
       throw new Error('DomPainter: document is not available');
@@ -4293,6 +4332,7 @@ export class DomPainter {
     // Wrap applyFragmentFrame to capture section from context
     // This ensures table cell fragments receive proper section context for PM position validation
     const applyFragmentFrameWithSection = (el: HTMLElement, frag: Fragment): void => {
+      // Table cell inner fragments always use legacy applyFragmentFrame (they are not resolved yet)
       this.applyFragmentFrame(el, frag, context.section);
     };
 
@@ -4352,7 +4392,7 @@ export class DomPainter {
       return this.createDrawingPlaceholder();
     };
 
-    return renderTableFragmentElement({
+    const el = renderTableFragmentElement({
       doc: this.doc,
       fragment,
       context,
@@ -4372,6 +4412,14 @@ export class DomPainter {
       applyContainerSdtDataset: this.applyContainerSdtDataset.bind(this),
       applyStyles,
     });
+
+    // Override outer wrapper positioning with resolved data when available.
+    // Inner cell fragments still use legacy applyFragmentFrame via deps closure.
+    if (resolvedItem) {
+      this.applyResolvedFragmentFrame(el, resolvedItem, fragment, context.section);
+    }
+
+    return el;
   }
 
   /**
@@ -4379,7 +4427,7 @@ export class DomPainter {
    * @returns Sanitized link data or null if invalid/missing
    */
   private extractLinkData(run: Run): LinkRenderData | null {
-    if (run.kind === 'tab' || run.kind === 'image' || run.kind === 'lineBreak') {
+    if (run.kind === 'tab' || run.kind === 'image' || run.kind === 'lineBreak' || run.kind === 'math') {
       return null;
     }
     const link = (run as TextRun).link as FlowRunLink | undefined;
@@ -4612,6 +4660,41 @@ export class DomPainter {
     return run.kind === 'fieldAnnotation';
   }
 
+  /**
+   * Type guard to check if a run is a math run.
+   */
+  private isMathRun(run: Run): run is MathRun {
+    return run.kind === 'math';
+  }
+
+  /**
+   * Render a math run as a MathML element wrapped in a span.
+   * Follows the same pattern as renderImageRun — sets explicit dimensions.
+   */
+  private renderMathRun(run: MathRun): HTMLElement | null {
+    if (!this.doc) return null;
+    const wrapper = this.doc.createElement('span');
+    wrapper.className = 'sd-math';
+    wrapper.style.display = 'inline-block';
+    wrapper.style.verticalAlign = 'middle';
+    wrapper.style.width = `${run.width}px`;
+    wrapper.style.height = `${run.height}px`;
+    wrapper.dataset.layoutEpoch = String(this.layoutEpoch ?? 0);
+
+    const mathEl = convertOmmlToMathml(run.ommlJson, this.doc);
+    if (mathEl) {
+      wrapper.appendChild(mathEl);
+    } else {
+      // Fallback: render plain text content
+      wrapper.textContent = run.textContent || '';
+    }
+
+    if (run.pmStart != null) wrapper.dataset.pmStart = String(run.pmStart);
+    if (run.pmEnd != null) wrapper.dataset.pmEnd = String(run.pmEnd);
+
+    return wrapper;
+  }
+
   private renderRun(
     run: Run,
     context: FragmentRenderContext,
@@ -4625,6 +4708,11 @@ export class DomPainter {
     // Handle FieldAnnotationRun - inline pill-styled form fields
     if (this.isFieldAnnotationRun(run)) {
       return this.renderFieldAnnotationRun(run);
+    }
+
+    // Handle MathRun - inline math rendered as MathML
+    if (this.isMathRun(run)) {
+      return this.renderMathRun(run);
     }
 
     // Handle LineBreakRun - line breaks are handled by the measurer creating new lines,
@@ -5294,6 +5382,7 @@ export class DomPainter {
    * @param lineIndex - Optional zero-based index of the line within the fragment
    * @param skipJustify - When true, prevents justification even if alignment is 'justify'
    * @param resolvedListTextStartPx - Optional canonical text-start override for list first lines
+   * @param indentOffsetOverride - When defined, used instead of re-deriving indentOffset from block attrs in the segment positioning path
    * @returns The rendered line element
    */
   private renderLine(
@@ -5304,6 +5393,7 @@ export class DomPainter {
     lineIndex?: number,
     skipJustify?: boolean,
     resolvedListTextStartPx?: number,
+    indentOffsetOverride?: number,
   ): HTMLElement {
     if (!this.doc) {
       throw new Error('DomPainter: document is not available');
@@ -5584,25 +5674,32 @@ export class DomPainter {
       //
       // The segment x positions from layout are relative to the content area (left margin = 0).
       // We need to add the paragraph indent to ALL positions (both explicit and calculated).
-      const paraIndent = (block.attrs as ParagraphAttrs | undefined)?.indent;
-      const indentLeft = paraIndent?.left ?? 0;
-      const firstLine = paraIndent?.firstLine ?? 0;
-      const hanging = paraIndent?.hanging ?? 0;
-      const isFirstLineOfPara = lineIndex === 0 || lineIndex === undefined;
-      const firstLineOffsetForCumX = isFirstLineOfPara ? firstLine - hanging : 0;
-      const wordLayoutValue = (block.attrs as ParagraphAttrs | undefined)?.wordLayout;
-      const wordLayout = isMinimalWordLayout(wordLayoutValue) ? wordLayoutValue : undefined;
-      const isListParagraph = Boolean(wordLayout?.marker);
-      const fallbackListTextStartPx =
-        typeof wordLayout?.marker?.textStartX === 'number' && Number.isFinite(wordLayout.marker.textStartX)
-          ? wordLayout.marker.textStartX
-          : typeof wordLayout?.textStartPx === 'number' && Number.isFinite(wordLayout.textStartPx)
-            ? wordLayout.textStartPx
-            : undefined;
-      const listIndentOffset = isFirstLineOfPara
-        ? (resolvedListTextStartPx ?? fallbackListTextStartPx ?? indentLeft)
-        : indentLeft;
-      const indentOffset = isListParagraph ? listIndentOffset : indentLeft + firstLineOffsetForCumX;
+      let indentOffset: number;
+      if (indentOffsetOverride != null) {
+        // Resolved path: indentOffset was pre-computed by the resolver.
+        indentOffset = indentOffsetOverride;
+      } else {
+        // Legacy path: derive from block attrs.
+        const paraIndent = (block.attrs as ParagraphAttrs | undefined)?.indent;
+        const indentLeft = paraIndent?.left ?? 0;
+        const firstLine = paraIndent?.firstLine ?? 0;
+        const hanging = paraIndent?.hanging ?? 0;
+        const isFirstLineOfPara = lineIndex === 0 || lineIndex === undefined;
+        const firstLineOffsetForCumX = isFirstLineOfPara ? firstLine - hanging : 0;
+        const wordLayoutValue = (block.attrs as ParagraphAttrs | undefined)?.wordLayout;
+        const wordLayout = isMinimalWordLayout(wordLayoutValue) ? wordLayoutValue : undefined;
+        const isListParagraph = Boolean(wordLayout?.marker);
+        const fallbackListTextStartPx =
+          typeof wordLayout?.marker?.textStartX === 'number' && Number.isFinite(wordLayout.marker.textStartX)
+            ? wordLayout.marker.textStartX
+            : typeof wordLayout?.textStartPx === 'number' && Number.isFinite(wordLayout.textStartPx)
+              ? wordLayout.textStartPx
+              : undefined;
+        const listIndentOffset = isFirstLineOfPara
+          ? (resolvedListTextStartPx ?? fallbackListTextStartPx ?? indentLeft)
+          : indentLeft;
+        indentOffset = isListParagraph ? listIndentOffset : indentLeft + firstLineOffsetForCumX;
+      }
       let cumulativeX = 0; // Start at 0, we'll add indentOffset when positioning
 
       const segments = line.segments!;
@@ -5808,6 +5905,26 @@ export class DomPainter {
             const baseSegX = runSegments && runSegments[0]?.x !== undefined ? runSegments[0].x : cumulativeX;
             const segX = baseSegX + indentOffset;
             const segWidth = (runSegments && runSegments[0]?.width !== undefined ? runSegments[0].width : 0) ?? 0;
+            elem.style.position = 'absolute';
+            elem.style.left = `${segX}px`;
+            appendToLineGeo(elem, baseRun, segX, segWidth);
+            cumulativeX = baseSegX + segWidth;
+          }
+          continue;
+        }
+
+        // Handle MathRun - render as-is (atomic unit like images)
+        if (this.isMathRun(baseRun)) {
+          const elem = this.renderRun(baseRun, context, trackedConfig);
+          if (elem) {
+            if (styleId) {
+              elem.setAttribute('styleid', styleId);
+            }
+            const runSegments = segmentsByRun.get(runIndex);
+            const baseSegX = runSegments && runSegments[0]?.x !== undefined ? runSegments[0].x : cumulativeX;
+            const segX = baseSegX + indentOffset;
+            const segWidth =
+              (runSegments && runSegments[0]?.width !== undefined ? runSegments[0].width : baseRun.width) ?? 0;
             elem.style.position = 'absolute';
             elem.style.left = `${segX}px`;
             appendToLineGeo(elem, baseRun, segX, segWidth);
@@ -6045,13 +6162,25 @@ export class DomPainter {
    *                  Affects PM position validation - only body sections validate PM positions.
    *                  If undefined, defaults to 'body' section behavior.
    */
-  private updateFragmentElement(el: HTMLElement, fragment: Fragment, section?: 'body' | 'header' | 'footer'): void {
-    this.applyFragmentFrame(el, fragment, section);
-    if (fragment.kind === 'image') {
-      el.style.height = `${fragment.height}px`;
+  private updateFragmentElement(
+    el: HTMLElement,
+    fragment: Fragment,
+    section?: 'body' | 'header' | 'footer',
+    resolvedItem?: ResolvedFragmentItem,
+  ): void {
+    if (fragment.kind === 'list-item' && resolvedItem) {
+      this.applyResolvedListItemWrapperFrame(el, fragment, resolvedItem, section);
+      return;
     }
-    if (fragment.kind === 'drawing') {
-      el.style.height = `${fragment.height}px`;
+
+    if (resolvedItem) {
+      this.applyResolvedFragmentFrame(el, resolvedItem, fragment, section);
+    } else {
+      this.applyFragmentFrame(el, fragment, section);
+      if (fragment.kind === 'image' || fragment.kind === 'drawing') {
+        el.style.height = `${fragment.height}px`;
+        this.applyFragmentWrapperZIndex(el, fragment);
+      }
     }
   }
 
@@ -6108,6 +6237,106 @@ export class DomPainter {
         delete el.dataset.continuesOnNext;
       }
     }
+  }
+
+  /**
+   * Applies PM position data attributes from a legacy Fragment.
+   * Extracted from applyFragmentFrame for use in the resolved wrapper path.
+   */
+  private applyFragmentPmAttributes(el: HTMLElement, fragment: Fragment, section?: 'body' | 'header' | 'footer'): void {
+    // Footnote content is read-only: prevent cursor placement and typing
+    if (typeof fragment.blockId === 'string' && fragment.blockId.startsWith('footnote-')) {
+      el.setAttribute('contenteditable', 'false');
+    }
+
+    if (fragment.kind === 'para') {
+      if (section === 'body' || section === undefined) {
+        assertFragmentPmPositions(fragment, 'paragraph fragment');
+      }
+      if (fragment.pmStart != null) {
+        el.dataset.pmStart = String(fragment.pmStart);
+      } else {
+        delete el.dataset.pmStart;
+      }
+      if (fragment.pmEnd != null) {
+        el.dataset.pmEnd = String(fragment.pmEnd);
+      } else {
+        delete el.dataset.pmEnd;
+      }
+      if (fragment.continuesFromPrev) {
+        el.dataset.continuesFromPrev = 'true';
+      } else {
+        delete el.dataset.continuesFromPrev;
+      }
+      if (fragment.continuesOnNext) {
+        el.dataset.continuesOnNext = 'true';
+      } else {
+        delete el.dataset.continuesOnNext;
+      }
+    }
+  }
+
+  /**
+   * Applies fragment wrapper positioning from a ResolvedFragmentItem.
+   * Uses resolved data for spatial properties and delegates PM attributes to the legacy path.
+   */
+  private isAnchoredMediaFragment(fragment: Fragment): fragment is ImageFragment | DrawingFragment {
+    return (fragment.kind === 'image' || fragment.kind === 'drawing') && fragment.isAnchored === true;
+  }
+
+  /**
+   * Only anchored images and drawings participate in explicit wrapper stacking.
+   * Inline media intentionally rely on DOM order to preserve legacy paint order.
+   */
+  private resolveFragmentWrapperZIndex(fragment: Fragment, resolvedZIndex?: number): string {
+    if (!this.isAnchoredMediaFragment(fragment)) {
+      return '';
+    }
+
+    const zIndex = resolvedZIndex ?? fragment.zIndex;
+    return zIndex != null ? String(zIndex) : '';
+  }
+
+  private applyFragmentWrapperZIndex(el: HTMLElement, fragment: Fragment, resolvedZIndex?: number): void {
+    el.style.zIndex = this.resolveFragmentWrapperZIndex(fragment, resolvedZIndex);
+  }
+
+  private applyResolvedFragmentFrame(
+    el: HTMLElement,
+    item: ResolvedFragmentItem,
+    fragment: Fragment,
+    section?: 'body' | 'header' | 'footer',
+  ): void {
+    el.style.left = `${item.x}px`;
+    el.style.top = `${item.y}px`;
+    el.style.width = `${item.width}px`;
+    el.dataset.blockId = item.blockId;
+    el.dataset.layoutEpoch = String(this.layoutEpoch);
+    this.applyFragmentWrapperZIndex(el, fragment, item.zIndex);
+
+    if (item.fragmentKind === 'image' || item.fragmentKind === 'drawing' || item.fragmentKind === 'table') {
+      el.style.height = `${item.height}px`;
+    }
+
+    this.applyFragmentPmAttributes(el, fragment, section);
+  }
+
+  /**
+   * Applies the resolved wrapper frame for a list-item fragment.
+   *
+   * List-item wrappers intentionally extend into the marker gutter. The resolved
+   * fragment item stores the paragraph content box, so the marker-width expansion
+   * must be applied consistently on both initial render and incremental updates.
+   */
+  private applyResolvedListItemWrapperFrame(
+    el: HTMLElement,
+    fragment: ListItemFragment,
+    item: ResolvedFragmentItem,
+    section?: 'body' | 'header' | 'footer',
+  ): void {
+    this.applyResolvedFragmentFrame(el, item, fragment, section);
+    el.style.left = `${item.x - fragment.markerWidth}px`;
+    el.style.width = `${item.width + fragment.markerWidth}px`;
   }
 
   /**
@@ -6982,7 +7211,8 @@ const applyRunStyles = (element: HTMLElement, run: Run, _isLink = false): void =
     run.kind === 'image' ||
     run.kind === 'lineBreak' ||
     run.kind === 'break' ||
-    run.kind === 'fieldAnnotation'
+    run.kind === 'fieldAnnotation' ||
+    run.kind === 'math'
   ) {
     // Tab, image, lineBreak, break, and fieldAnnotation runs don't have text styling properties
     return;
@@ -7256,6 +7486,12 @@ export const sliceRunsForLine = (block: ParagraphBlock, line: Line): Run[] => {
 
     // FieldAnnotationRun handling - field annotations are atomic units like images
     if (run.kind === 'fieldAnnotation') {
+      result.push(run);
+      continue;
+    }
+
+    // MathRun handling - math runs are atomic units like images
+    if (run.kind === 'math') {
       result.push(run);
       continue;
     }
